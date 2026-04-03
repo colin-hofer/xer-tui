@@ -4,6 +4,8 @@
 
 It opens an `.xer` file, splits it into tables, and lets you scroll through rows and columns in a dataframe-style view.
 
+![xer-viewer screenshot](xer-viewer.png)
+
 ## Install
 
 From this repo:
