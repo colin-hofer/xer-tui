@@ -1,42 +1,52 @@
 package viewer
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"xer-tui/internal/update"
+	"xer-tui/internal/version"
 )
 
 type keyMap struct {
-	NextTable key.Binding
-	PrevTable key.Binding
-	Down      key.Binding
-	Up        key.Binding
-	PageDown  key.Binding
-	PageUp    key.Binding
-	Right     key.Binding
-	Left      key.Binding
-	FastRight key.Binding
-	FastLeft  key.Binding
-	Top       key.Binding
-	Bottom    key.Binding
-	Home      key.Binding
-	Help      key.Binding
-	Quit      key.Binding
+	NextTable   key.Binding
+	PrevTable   key.Binding
+	Down        key.Binding
+	Up          key.Binding
+	PageDown    key.Binding
+	PageUp      key.Binding
+	Right       key.Binding
+	Left        key.Binding
+	FastRight   key.Binding
+	FastLeft    key.Binding
+	Top         key.Binding
+	Bottom      key.Binding
+	Home        key.Binding
+	Search      key.Binding
+	FilterTable key.Binding
+	NextMatch   key.Binding
+	PrevMatch   key.Binding
+	Update      key.Binding
+	Help        key.Binding
+	Quit        key.Binding
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.NextTable, k.Down, k.Right, k.Help, k.Quit}
+	return []key.Binding{k.NextTable, k.Down, k.Right, k.Search, k.FilterTable, k.Help, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.NextTable, k.PrevTable, k.Down, k.Up, k.PageDown, k.PageUp},
 		{k.Right, k.Left, k.FastRight, k.FastLeft, k.Home, k.Top, k.Bottom},
-		{k.Help, k.Quit},
+		{k.Search, k.FilterTable, k.NextMatch, k.PrevMatch, k.Update, k.Help, k.Quit},
 	}
 }
 
@@ -51,6 +61,16 @@ type Model struct {
 	selectedRow  int
 	rowScroll    int
 	columnScroll int
+
+	searchMode      string // "", "row", "table"
+	searchInput     textinput.Model
+	filteredIndices []int
+	rowQuery        string
+	matchedRows     []int
+
+	checkingUpdate  bool
+	UpdateRequested bool
+	status          string
 
 	showHelp bool
 	keys     keyMap
@@ -85,15 +105,20 @@ func NewModel(data *FileData) Model {
 	h := help.New()
 	h.ShowAll = false
 
+	si := textinput.New()
+	si.Prompt = "/"
+	si.CharLimit = 64
+
 	return Model{
-		data: data,
+		data:        data,
+		searchInput: si,
 		keys: keyMap{
 			NextTable: key.NewBinding(key.WithKeys("tab", "]"), key.WithHelp("tab", "next table")),
 			PrevTable: key.NewBinding(key.WithKeys("shift+tab", "["), key.WithHelp("shift+tab", "prev table")),
 			Down:      key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("j/down", "next row")),
 			Up:        key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("k/up", "prev row")),
 			PageDown:  key.NewBinding(key.WithKeys("pgdown", "d"), key.WithHelp("pgdn", "page down")),
-			PageUp:    key.NewBinding(key.WithKeys("pgup", "u"), key.WithHelp("pgup", "page up")),
+			PageUp:    key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "page up")),
 			Right:     key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("l/right", "scroll right")),
 			Left:      key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("h/left", "scroll left")),
 			FastRight: key.NewBinding(key.WithKeys("L"), key.WithHelp("L", "jump right")),
@@ -101,10 +126,36 @@ func NewModel(data *FileData) Model {
 			Home:      key.NewBinding(key.WithKeys("0"), key.WithHelp("0", "left edge")),
 			Top:       key.NewBinding(key.WithKeys("g", "home"), key.WithHelp("g", "top")),
 			Bottom:    key.NewBinding(key.WithKeys("G", "end"), key.WithHelp("G", "bottom")),
+			Search:      key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search rows")),
+			FilterTable: key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "filter tables")),
+			NextMatch:   key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next match")),
+			PrevMatch:   key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev match")),
+			Update:      key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "update xv")),
 			Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "toggle help")),
 			Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 		},
 		help: h,
+	}
+}
+
+type updateCheckMsg struct {
+	Result update.Result
+	Err    error
+}
+
+func checkForUpdateCmd() tea.Cmd {
+	return func() tea.Msg {
+		updater, err := update.New(update.Config{
+			RepoOwner:      version.RepositoryOwner,
+			RepoName:       version.RepositoryName,
+			BinaryName:     version.BinaryName,
+			CurrentVersion: version.Current(),
+		})
+		if err != nil {
+			return updateCheckMsg{Err: err}
+		}
+		result, err := updater.Check(context.Background())
+		return updateCheckMsg{Result: result, Err: err}
 	}
 }
 
@@ -119,17 +170,65 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = typed.Height
 		m.clamp()
 		return m, nil
+
+	case updateCheckMsg:
+		m.checkingUpdate = false
+		if typed.Err != nil {
+			m.status = typed.Err.Error()
+			return m, nil
+		}
+		if !typed.Result.Available {
+			m.status = fmt.Sprintf("already up to date (%s)", displayVersion(typed.Result.LatestVersion))
+			return m, nil
+		}
+		m.status = fmt.Sprintf("update %s -> %s available, closing to install...",
+			displayVersion(typed.Result.PreviousVersion),
+			displayVersion(typed.Result.LatestVersion))
+		m.UpdateRequested = true
+		return m, tea.Quit
+
 	case tea.KeyMsg:
+		if m.status != "" {
+			m.status = ""
+		}
+
+		if m.searchMode != "" {
+			return m.updateSearch(typed)
+		}
+
 		switch {
 		case key.Matches(typed, m.keys.Quit):
 			return m, tea.Quit
+		case key.Matches(typed, m.keys.Search):
+			m.searchMode = "row"
+			m.searchInput.Prompt = "/"
+			m.searchInput.SetValue("")
+			return m, m.searchInput.Focus()
+		case key.Matches(typed, m.keys.FilterTable):
+			m.searchMode = "table"
+			m.searchInput.Prompt = "t:"
+			m.searchInput.SetValue("")
+			m.filteredIndices = nil
+			m.tableScroll = 0
+			return m, m.searchInput.Focus()
+		case key.Matches(typed, m.keys.NextMatch):
+			m.jumpToMatch(1)
+		case key.Matches(typed, m.keys.PrevMatch):
+			m.jumpToMatch(-1)
+		case key.Matches(typed, m.keys.Update):
+			if m.checkingUpdate {
+				return m, nil
+			}
+			m.status = "checking latest release..."
+			m.checkingUpdate = true
+			return m, checkForUpdateCmd()
 		case key.Matches(typed, m.keys.Help):
 			m.showHelp = !m.showHelp
 			m.help.ShowAll = m.showHelp
 		case key.Matches(typed, m.keys.NextTable):
-			m.setTable(m.tableIndex + 1)
+			m.setTable(m.visibleTablePos() + 1)
 		case key.Matches(typed, m.keys.PrevTable):
-			m.setTable(m.tableIndex - 1)
+			m.setTable(m.visibleTablePos() - 1)
 		case key.Matches(typed, m.keys.Down):
 			m.moveRow(1)
 		case key.Matches(typed, m.keys.Up):
@@ -164,6 +263,159 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		m.searchInput.Blur()
+		if m.searchMode == "table" {
+			if len(m.filteredIndices) > 0 {
+				m.tableIndex = m.filteredIndices[0]
+			}
+			m.selectedRow = 0
+			m.rowScroll = 0
+			m.columnScroll = 0
+		} else if m.searchMode == "row" {
+			m.rowQuery = m.searchInput.Value()
+			m.buildRowMatches()
+			m.jumpToMatch(0)
+		}
+		m.searchMode = ""
+		m.clamp()
+		return m, nil
+	case "esc":
+		m.searchInput.Blur()
+		m.searchInput.SetValue("")
+		if m.searchMode == "table" {
+			m.filteredIndices = nil
+			m.tableScroll = 0
+		}
+		m.searchMode = ""
+		m.clamp()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+	if m.searchMode == "table" {
+		m.updateTableFilter()
+	}
+	return m, cmd
+}
+
+func (m *Model) updateTableFilter() {
+	query := strings.ToLower(m.searchInput.Value())
+	if query == "" {
+		m.filteredIndices = nil
+		return
+	}
+	m.filteredIndices = make([]int, 0)
+	for i, table := range m.data.Tables {
+		if strings.Contains(strings.ToLower(table.Name), query) {
+			m.filteredIndices = append(m.filteredIndices, i)
+		}
+	}
+	if len(m.filteredIndices) > 0 {
+		m.tableIndex = m.filteredIndices[0]
+		m.selectedRow = 0
+		m.rowScroll = 0
+		m.columnScroll = 0
+	}
+	m.tableScroll = 0
+}
+
+func (m *Model) buildRowMatches() {
+	m.matchedRows = m.matchedRows[:0:0]
+	query := strings.ToLower(m.rowQuery)
+	if query == "" {
+		return
+	}
+	table := m.currentTable()
+	for row := 0; row < table.RowCount(); row++ {
+		for col := 0; col < table.ColumnCount(); col++ {
+			if strings.Contains(strings.ToLower(table.Cell(row, col)), query) {
+				m.matchedRows = append(m.matchedRows, row)
+				break
+			}
+		}
+	}
+}
+
+func (m *Model) jumpToMatch(direction int) {
+	if len(m.matchedRows) == 0 {
+		m.status = "no matches"
+		return
+	}
+
+	if direction == 0 {
+		m.selectedRow = m.matchedRows[0]
+		m.ensureRowVisible()
+		m.status = fmt.Sprintf("match 1/%d", len(m.matchedRows))
+		return
+	}
+
+	target := -1
+	if direction > 0 {
+		for _, r := range m.matchedRows {
+			if r > m.selectedRow {
+				target = r
+				break
+			}
+		}
+		if target == -1 {
+			target = m.matchedRows[0]
+		}
+	} else {
+		for i := len(m.matchedRows) - 1; i >= 0; i-- {
+			if m.matchedRows[i] < m.selectedRow {
+				target = m.matchedRows[i]
+				break
+			}
+		}
+		if target == -1 {
+			target = m.matchedRows[len(m.matchedRows)-1]
+		}
+	}
+
+	m.selectedRow = target
+	m.ensureRowVisible()
+
+	pos := 0
+	for i, r := range m.matchedRows {
+		if r == target {
+			pos = i + 1
+			break
+		}
+	}
+	m.status = fmt.Sprintf("match %d/%d", pos, len(m.matchedRows))
+}
+
+func (m Model) visibleTables() []int {
+	if m.filteredIndices != nil {
+		return m.filteredIndices
+	}
+	all := make([]int, len(m.data.Tables))
+	for i := range all {
+		all[i] = i
+	}
+	return all
+}
+
+func (m Model) visibleTablePos() int {
+	for i, idx := range m.visibleTables() {
+		if idx == m.tableIndex {
+			return i
+		}
+	}
+	return 0
+}
+
+func displayVersion(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return value
+}
+
 func (m Model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ""
@@ -174,6 +426,9 @@ func (m Model) View() string {
 	}
 
 	headerLine := appStyles.Title.Render(fmt.Sprintf("xv  %s", m.data.Name))
+	if m.status != "" {
+		headerLine += "  " + appStyles.Muted.Render(m.status)
+	}
 	contentHeight := m.height - 2
 	if contentHeight < 4 {
 		contentHeight = 4
@@ -186,7 +441,12 @@ func (m Model) View() string {
 	right := m.renderMain(contentHeight, mainWidth)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
-	footer := m.help.View(m.keys)
+	var footer string
+	if m.searchMode != "" {
+		footer = m.searchInput.View()
+	} else {
+		footer = m.help.View(m.keys)
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, headerLine, body, footer)
 }
 
@@ -198,21 +458,25 @@ func (m *Model) currentTable() TableData {
 }
 
 func (m *Model) setTable(index int) {
-	if len(m.data.Tables) == 0 {
+	tables := m.visibleTables()
+	if len(tables) == 0 {
 		return
 	}
 
 	switch {
 	case index < 0:
-		index = len(m.data.Tables) - 1
-	case index >= len(m.data.Tables):
+		index = len(tables) - 1
+	case index >= len(tables):
 		index = 0
 	}
 
-	m.tableIndex = index
+	m.tableIndex = tables[index]
 	m.selectedRow = 0
 	m.rowScroll = 0
 	m.columnScroll = 0
+	if m.rowQuery != "" {
+		m.buildRowMatches()
+	}
 	m.ensureTableVisible()
 }
 
@@ -298,12 +562,13 @@ func (m *Model) ensureRowVisible() {
 }
 
 func (m *Model) ensureTableVisible() {
+	pos := m.visibleTablePos()
 	visible := max(1, m.contentHeight()-1)
-	if m.tableIndex < m.tableScroll {
-		m.tableScroll = m.tableIndex
+	if pos < m.tableScroll {
+		m.tableScroll = pos
 	}
-	if m.tableIndex >= m.tableScroll+visible {
-		m.tableScroll = m.tableIndex - visible + 1
+	if pos >= m.tableScroll+visible {
+		m.tableScroll = pos - visible + 1
 	}
 }
 
@@ -334,14 +599,21 @@ func (m Model) tableViewportWidth() int {
 
 func (m Model) renderSidebar(height, width int) string {
 	lines := make([]string, 0, height)
-	lines = append(lines, fitToWidth(appStyles.SidebarTitle.Render("Tables"), width))
+	tables := m.visibleTables()
+
+	title := "Tables"
+	if len(m.filteredIndices) > 0 {
+		title = fmt.Sprintf("Tables (%d)", len(m.filteredIndices))
+	}
+	lines = append(lines, fitToWidth(appStyles.SidebarTitle.Render(title), width))
 
 	visible := max(1, height-1)
-	end := min(len(m.data.Tables), m.tableScroll+visible)
-	for i := m.tableScroll; i < end; i++ {
-		label := fitToWidth(m.tableLabel(m.data.Tables[i]), width)
+	end := min(len(tables), m.tableScroll+visible)
+	for si := m.tableScroll; si < end; si++ {
+		realIndex := tables[si]
+		label := fitToWidth(m.tableLabel(m.data.Tables[realIndex]), width)
 		style := appStyles.SidebarItem
-		if i == m.tableIndex {
+		if realIndex == m.tableIndex {
 			style = appStyles.SidebarActive
 		}
 		lines = append(lines, style.Width(width).Render(label))
